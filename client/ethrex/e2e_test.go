@@ -27,14 +27,20 @@ import (
 )
 
 // pinnedEthrexImage is the upstream ethrex Docker image the e2e suite pins
-// against, digest-pinned for reproducibility. Override with
-// ETHREX_IMAGE=ghcr.io/lambdaclass/ethrex:<tag> to test a specific release.
+// against, digest-pinned for reproducibility. Override with ETHREX_IMAGE=<ref>
+// to test a specific build.
 //
-// Official release v23.0.0 (ghcr tag 23.0.0, published 2026-07-27). Boot
-// requires --skip-genesis-validation (lambdaclass/ethrex#6783, ≥v16.0.0).
+// ethpandaops glamsterdam-devnet-7, ethrex commit 55433c2 — a pre-release
+// build, not a tagged release, because the latest release (v23.0.0) predates
+// two changes state-actor has to match: account_codes values carry a JUMPDEST
+// bitmap instead of an RLP list of u32 offsets (lambdaclass/ethrex#7095), and
+// TABLES gained state_history. Boot requires --skip-genesis-validation
+// (lambdaclass/ethrex#6783, ≥v16.0.0).
+//
 // This pin is also the source of internal/ethrex's Tables and of
-// testdata/genesis_dump.json; move all three together.
-const pinnedEthrexImage = "ghcr.io/lambdaclass/ethrex:23.0.0@sha256:1cbf2c4b498efcc71dc776a130cf5eed3f15d100896a18f05b6fa426ff0e7fc5"
+// testdata/genesis_dump.json; move all three together. Repin to a release tag
+// once one carries both changes.
+const pinnedEthrexImage = "ethpandaops/ethrex:glamsterdam-devnet-7@sha256:e7ac50527b162f6fc8ac5f788dfad6996c63ab215560e918144937b999435624"
 
 func ethrexImageRef() string {
 	if v := os.Getenv("ETHREX_IMAGE"); v != "" {

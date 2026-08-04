@@ -1,7 +1,7 @@
 package ethrex
 
 // Column-family names for ethrex's single RocksDB instance.
-// Sourced from ethrex crates/storage/api/tables.rs at v23.0.0.
+// Sourced from ethrex crates/storage/api/tables.rs at commit 55433c2.
 const (
 	CFChainData            = "chain_data"
 	CFAccountCodes         = "account_codes"
@@ -23,10 +23,11 @@ const (
 	CFMiscValues           = "misc_values"
 	CFExecutionWitnesses   = "execution_witnesses"
 	CFBlockAccessLists     = "block_access_lists"
+	CFStateHistory         = "state_history"
 	CFBadBlocks            = "bad_blocks"
 )
 
-// Tables is the ordered list of all 21 ethrex column families, matching
+// Tables is the ordered list of all 22 ethrex column families, matching
 // ethrex's TABLES array. It must not run ahead of the boot pin in
 // client/ethrex/e2e_test.go: ethrex silently drops any CF absent from
 // its own TABLES (drop_obsolete_cfs, warn-only).
@@ -51,6 +52,7 @@ var Tables = []string{
 	CFMiscValues,
 	CFExecutionWitnesses,
 	CFBlockAccessLists,
+	CFStateHistory,
 	CFBadBlocks,
 }
 

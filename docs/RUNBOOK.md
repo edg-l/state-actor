@@ -304,7 +304,7 @@ docker run --rm \
 
 **On-disk layout:**
 
-- `/data/` — single RocksDB instance with 21 column families (see `internal/ethrex/constants.go` for the full list)
+- `/data/` — single RocksDB instance with 22 column families (see `internal/ethrex/constants.go` for the full list)
 - `/data/metadata.json` — `{"schema_version": 3}`, required by ethrex `Store::new`
 - `/data/ethrex-genesis.json` — full genesis JSON; pass via `--network` when booting
 

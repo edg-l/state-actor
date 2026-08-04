@@ -159,10 +159,11 @@ const (
 	cfIdxMiscValues           = 17
 	cfIdxExecutionWitnesses   = 18
 	cfIdxBlockAccessLists     = 19
-	cfIdxBadBlocks            = 20
+	cfIdxStateHistory         = 20
+	cfIdxBadBlocks            = 21
 )
 
-// ethrexDB holds the open grocksdb handle and the 21 CF handles.
+// ethrexDB holds the open grocksdb handle and the 22 CF handles.
 type ethrexDB struct {
 	db     *grocksdb.DB
 	cfs    []*grocksdb.ColumnFamilyHandle
@@ -214,11 +215,11 @@ func openEthrexDB(dbPath string) (*ethrexDB, error) {
 		return nil, fmt.Errorf("ethrex: mkdir: %w", err)
 	}
 
-	// The 21 named ethrex CFs, plus RocksDB's implicit "default" CF appended
-	// LAST (index 21). RocksDB always creates "default" on a fresh DB, and an
+	// The 22 named ethrex CFs, plus RocksDB's implicit "default" CF appended
+	// LAST (index 22). RocksDB always creates "default" on a fresh DB, and an
 	// open call must account for every existing CF or it errors with "you have
 	// to open all column families". Appending it keeps the cfIdx* constants
-	// (0..20) aligned with Tables; cfs[21] (default) is created but never
+	// (0..21) aligned with Tables; cfs[22] (default) is created but never
 	// written. Mirrors besu's explicit CFDefault inclusion.
 	cfNames := make([]string, 0, len(ethrexinternal.Tables)+1)
 	cfNames = append(cfNames, ethrexinternal.Tables...)
@@ -306,23 +307,33 @@ func openEthrexDB(dbPath string) (*ethrexDB, error) {
 			opts.SetMaxBytesForLevelBase(ethrexStateCFLevelBaseBytes())
 			bbto.SetBlockSize(16 << 10)
 			bbto.SetFilterPolicy(grocksdb.NewBloomFilterFull(10))
-		case cfIdxAccountCodes:
+		case cfIdxAccountCodes, cfIdxAccountCodeMetadata:
 			opts.SetWriteBufferSize(128 << 20)
 			opts.SetMaxWriteBufferNumber(3)
 			opts.SetTargetFileSizeBase(256 << 20)
-			// Bytecodes go to blob files; small ones (delegation indicators)
-			// stay inline. Blobs are LZ4-compressed.
-			opts.EnableBlobFiles(true)
-			opts.SetMinBlobSize(32)
-			opts.SetBlobCompressionType(grocksdb.LZ4Compression)
-			bbto.SetBlockSize(32 << 10)
+			if i == cfIdxAccountCodes {
+				// Bytecodes go to blob files; small ones (delegation indicators)
+				// stay inline. Blobs are LZ4-compressed.
+				opts.EnableBlobFiles(true)
+				opts.SetMinBlobSize(32)
+				opts.SetBlobCompressionType(grocksdb.LZ4Compression)
+			}
+			// Both CFs answer exact-key point lookups on ethrex's execution
+			// path: EXT*/CALL* resolve a code hash to its bytecode or its
+			// length. A page-sized block keeps per-get read amplification down
+			// — with blob files the SST value is only a blob reference, so a
+			// larger block buys nothing — and the filter prunes the levels that
+			// cannot hold the hash.
+			bbto.SetBlockSize(4 << 10)
+			bbto.SetFilterPolicy(grocksdb.NewBloomFilterFull(10))
 		case cfIdxReceiptsV2:
 			opts.SetWriteBufferSize(128 << 20)
 			opts.SetMaxWriteBufferNumber(3)
 			opts.SetTargetFileSizeBase(256 << 20)
 			bbto.SetBlockSize(32 << 10)
 		default:
-			// Also covers transaction_locations, whose ethrex arm carries the
+			// Also covers state_history, which has no dedicated arm in ethrex
+			// either, and transaction_locations, whose ethrex arm carries the
 			// same values plus a merge operator — omitted here: state-actor
 			// writes no rows there, and a CF created without one reopens
 			// cleanly with one registered.

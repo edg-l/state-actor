@@ -2,12 +2,13 @@
 //
 // # On-disk layout
 //
-// A single RocksDB instance at <dbPath> with 21 column families (Tables in
+// A single RocksDB instance at <dbPath> with 22 column families (Tables in
 // internal/ethrex/constants.go), all declared at open time. CFs written at genesis:
 //   - account_trie_nodes / storage_trie_nodes: MPT structural + leaf-NODE-RLP rows
 //     (storage rows are address-prefixed)
 //   - account_flatkeyvalue / storage_flatkeyvalue: leaf full-path → value
-//   - account_codes / account_code_metadata: code hash → EncodeCode / len
+//   - account_codes / account_code_metadata: code hash → EncodeCode
+//     (RLP(bytecode) ++ RLP(JUMPDEST bitmap)) / u64-BE len
 //   - chain_data: ChainConfig (key 0x80) + block-number sentinels (0x01, 0x04)
 //   - misc_values: "last_written" → 0xff (FKV "fully generated" sentinel)
 //   - headers / bodies / block_numbers / canonical_block_hashes: genesis block
@@ -30,12 +31,14 @@
 // add_initial_state short-circuits when canonical_block_hashes[0] → headers[hash]
 // matches genesis.get_block().hash(), so ethrex never recomputes state at boot.
 //
-// # Pinned releases
+// # Pin
 //
 // Golden test: byte-exact vs testdata/genesis_dump.json, regenerated at ethrex
-// v23.0.0; the state-bearing CFs are byte-identical v13–v23. E2e boot test
-// (e2e_test.go) pins the same v23.0.0 image. --skip-genesis-validation, which
-// the boot path requires, landed in v16.0.0 (lambdaclass/ethrex#6783).
+// commit 55433c2 (the ethpandaops glamsterdam-devnet-7 build), which the e2e
+// boot test pins too. A pre-release commit rather than a tag: v23.0.0 predates
+// both the account_codes JUMPDEST bitmap (lambdaclass/ethrex#7095) and the
+// state_history CF. --skip-genesis-validation, which the boot path requires,
+// landed in v16.0.0 (lambdaclass/ethrex#6783).
 //
 // # Build
 //
