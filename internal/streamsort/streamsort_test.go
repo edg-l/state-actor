@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/cockroachdb/pebble"
 )
 
 // TestStoreSortsRandomInput puts 10 000 uniformly-random 32-byte keys
@@ -90,6 +92,58 @@ func TestStoreSortsRandomInput(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Errorf("Iterate dropped %d keys", len(want))
+	}
+}
+
+// TestStoreOpensAtLowestFormatMajorVersion pins New to the lowest format
+// major version Pebble supports. A regression back to FormatNewest (or any
+// version above FormatMostCompatible) reintroduces the format-version-ratchet
+// fsync storm this const guards against — see the comment on New.
+func TestStoreOpensAtLowestFormatMajorVersion(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+	if got := s.db.FormatMajorVersion(); got != pebble.FormatMostCompatible {
+		t.Errorf("FormatMajorVersion = %d, want %d (FormatMostCompatible)", got, pebble.FormatMostCompatible)
+	}
+}
+
+// TestStoreLowFormatMajorVersionRoundTrip is the write+flush+iterate round
+// trip Task 1 requires: at FormatMostCompatible, Put/Finalize/Iterate must
+// still work and preserve ascending key order, exactly as at any other
+// format version.
+func TestStoreLowFormatMajorVersionRoundTrip(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	keys := []string{"c", "a", "e", "b", "d"}
+	for _, k := range keys {
+		if err := s.Put([]byte(k), []byte("v-"+k)); err != nil {
+			t.Fatalf("Put(%s): %v", k, err)
+		}
+	}
+	if err := s.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	var got []string
+	if err := s.Iterate(func(k, v []byte) error {
+		if want := "v-" + string(k); string(v) != want {
+			return fmt.Errorf("value for %q = %q, want %q", k, v, want)
+		}
+		got = append(got, string(k))
+		return nil
+	}); err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	want := []string{"a", "b", "c", "d", "e"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Iterate order = %v, want %v", got, want)
 	}
 }
 
@@ -644,6 +698,47 @@ func TestCursorRoundRobin(t *testing.T) {
 			t.Fatalf("cursor err: %v", err)
 		}
 	}
+}
+
+// BenchmarkStoreNewClose measures the fixed bootstrap cost of an empty
+// Store — os.MkdirTemp + pebble.Open + pebble.Close + os.RemoveAll, with no
+// Put or Iterate at all. This is the cost StorageRoot pays once per
+// PreAlloc entity regardless of how many slots it has, so it should stay
+// near a millisecond; a regression here (e.g. the format-version ratchet
+// this package's FormatMajorVersion comment guards against) turns into
+// hours at 150,000 entities.
+func BenchmarkStoreNewClose(b *testing.B) {
+	dir := b.TempDir()
+	for i := 0; i < b.N; i++ {
+		s, err := New(dir)
+		if err != nil {
+			b.Fatalf("New: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			b.Fatalf("Close: %v", err)
+		}
+	}
+}
+
+// BenchmarkStoreNewCloseParallel runs the same empty-store bootstrap
+// concurrently. Run with `-cpu 1,2,4,8` to reproduce the degradation a
+// competing writer on the same volume causes: each Store's fsyncs (WAL
+// marker moves, directory syncs) serialise in the shared filesystem
+// journal, so wall time per empty store grows with concurrency even though
+// no work is being done.
+func BenchmarkStoreNewCloseParallel(b *testing.B) {
+	dir := b.TempDir()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			s, err := New(dir)
+			if err != nil {
+				b.Fatalf("New: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				b.Fatalf("Close: %v", err)
+			}
+		}
+	})
 }
 
 // TestGetter verifies the reusable SeekGE Getter: present keys (ascending

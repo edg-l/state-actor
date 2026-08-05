@@ -156,8 +156,24 @@ func NewWithOptions(workDir string, opts Options) (*Store, error) {
 		BytesPerSync:             0,
 		WALBytesPerSync:          0,
 		NoSyncOnClose:            true,
-		FormatMajorVersion:       pebble.FormatNewest,
-		Cache:                    cache,
+		// FormatMostCompatible (1) is the lowest format major version Pebble
+		// has — the one a brand-new DB already opens at. Ratcheting to a
+		// higher version (e.g. FormatNewest) is a one-step-at-a-time durable
+		// upgrade (format_major_version.go): each step calls
+		// finalizeFormatVersUpgrade, which fsyncs a new marker file. Reaching
+		// FormatNewest from a fresh store costs 15 such fsyncs — for a store
+		// that this package creates, drains with one sequential Iterate, and
+		// deletes. Nothing ever reopens it at a newer format and no other
+		// process ever reads it, so there is nothing to gain from the later
+		// formats (range keys, block property collectors, value blocks,
+		// virtual SSTables). Set/Get/Iterate/SeekGE with NoCompression — the
+		// only operations this package uses — have worked since format 1.
+		//
+		// A future Pebble upgrade may deprecate/remove FormatMostCompatible;
+		// if it does, use the lowest surviving format version instead of
+		// reaching for FormatNewest again.
+		FormatMajorVersion: pebble.FormatMostCompatible,
+		Cache:              cache,
 		Levels: []pebble.LevelOptions{
 			{Compression: sstable.NoCompression},
 		},
