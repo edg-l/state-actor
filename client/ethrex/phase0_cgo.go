@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -63,8 +64,12 @@ func runPhase0Storage(
 	// for hours on bloat specs. The count-only slot heartbeat funnels every
 	// worker's per-slot count through one SlotMeter; each worker holds its own
 	// SlotWorker so the hot per-slot path stays cheap (one non-atomic add + mask).
+	// SlotMeter alone is blind to per-entity setup cost — an entity with few
+	// slots barely moves it — so an EntityMeter alongside it counts whole
+	// entities and the wall time split between Drain and IterateRoot.
 	cfg.Progress.Stage("ethrex: phase 0 — spec storage")
 	slotMeter := cfg.Progress.SlotMeter()
+	entityMeter := cfg.Progress.EntityMeter()
 
 	workers := runtime.NumCPU()
 	if workers < 1 {
@@ -93,6 +98,7 @@ func runPhase0Storage(
 		go func() {
 			defer wg.Done()
 			slotW := slotMeter.Worker()
+			entW := entityMeter.Worker()
 
 			// Each worker owns its own write batches targeting the two storage CFs.
 			// Per-worker batches avoid contention and keep each worker's writes
@@ -152,11 +158,26 @@ func runPhase0Storage(
 					return nil
 				}
 
-				root, err := streamingtrie.StorageRoot(cfg.DBPath, pe.Storage, hb, statSink)
+				// Timed as two halves (rather than through streamingtrie.StorageRoot)
+				// so the entity heartbeat can show whether time is going into
+				// draining slots or into per-entity Drain/IterateRoot setup.
+				drainStart := time.Now()
+				d, err := streamingtrie.Drain(cfg.DBPath, pe.Storage)
+				if err != nil {
+					cancelDrain(fmt.Errorf("ethrex: storage drain (PreAlloc %s): %w", addr.Hex(), err))
+					return
+				}
+				drainDur := time.Since(drainStart)
+
+				iterStart := time.Now()
+				root, err := d.IterateRoot(hb, statSink)
+				d.Close()
+				iterDur := time.Since(iterStart)
 				if err != nil {
 					cancelDrain(fmt.Errorf("ethrex: storage root (PreAlloc %s): %w", addr.Hex(), err))
 					return
 				}
+				entW.Entity(drainDur, iterDur)
 
 				select {
 				case resultCh <- phase0Result{
