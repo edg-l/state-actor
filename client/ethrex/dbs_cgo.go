@@ -22,6 +22,23 @@ import (
 // during bulk import.
 const bulkBackgroundJobs = 8
 
+// delayedWriteRateBytes replaces RocksDB's delayed_write_rate default of
+// 16 MiB/s for the duration of the import.
+//
+// The default is an OLTP-server protection: once any CF reaches
+// max_write_buffer_number-1 immutable memtables, RocksDB's write controller
+// clamps EVERY writer to that rate. During bulk import the clamp engages
+// (the LOG carries "Stalling writes because we have N immutable memtables")
+// and import workers park in D-state inside db.Write — a 16 MiB/s ceiling on
+// a volume that sustains hundreds of MiB/s. A one-shot import has no
+// concurrent readers to protect, so the correct backpressure is the disk
+// itself, with max_write_buffer_number remaining as the hard backstop.
+//
+// 1 GiB/s is chosen to sit above any plausible sustained write rate of a
+// datadir volume, making the soft throttle inert rather than tuned. Lower it
+// below the volume's sustained rate only to deliberately rate-limit a run.
+const delayedWriteRateBytes = 1 << 30
+
 // defaultStateCFLevelBaseMiB is max_bytes_for_level_base for the four state
 // CFs, in MiB: 2 GiB, matching besu and nethermind.
 //
@@ -394,6 +411,28 @@ func openEthrexDB(dbPath string) (*ethrexDB, error) {
 	// this is safe where concurrency ACROSS CFs was not — see the CF loop in
 	// Close, which stays serial for exactly that reason.
 	dbOpts.SetMaxSubcompactions(uint32(parallelism))
+
+	// delayed_write_rate is absent from RocksDB's C API, so it is set through
+	// the options-string parser — the same route client/nethermind uses for
+	// its CF options. See delayedWriteRateBytes for why the default is wrong
+	// for this workload.
+	tunedOpts, err := grocksdb.GetOptionsFromString(dbOpts,
+		fmt.Sprintf("delayed_write_rate=%d;", delayedWriteRateBytes))
+	if err != nil {
+		dbOpts.Destroy()
+		for _, o := range cfOpts {
+			o.Destroy()
+		}
+		for _, b := range bbtos {
+			if b != nil {
+				b.Destroy()
+			}
+		}
+		cache.Destroy()
+		return nil, fmt.Errorf("ethrex: set delayed_write_rate: %w", err)
+	}
+	dbOpts.Destroy()
+	dbOpts = tunedOpts
 
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(
 		dbOpts, dbPath, cfNames, cfOpts,
