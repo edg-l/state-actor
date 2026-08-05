@@ -70,11 +70,16 @@ type NodeSink func(pathNibbles []byte, value []byte) error
 // wrap the NodeSink to prepend the 66-nibble storage prefix:
 // nibbles(keccak256(addr)) ++ [LeafFlag] ++ [StorageSeparator] ++ path.
 type Builder struct {
-	sink      NodeSink
-	started   bool
-	keyLen    int           // nibble length of all keys (set on first AddLeaf)
-	prevKey   []byte        // most recent key (owned copy); the open spine leaf
-	prevVal   []byte        // most recent value (owned copy)
+	sink    NodeSink
+	started bool
+	keyLen  int    // nibble length of all keys (set on first AddLeaf)
+	prevKey []byte // most recent key (owned copy); the open spine leaf
+	prevVal []byte // most recent value (owned copy)
+	// rootDepth is how many leading nibbles an ancestor trie has already
+	// consumed. Zero for a standalone trie (Root); positive for a subtrie
+	// built by NewSubtrieBuilder, whose reference is retrieved with
+	// SubtrieRef instead. Every key must share those leading nibbles.
+	rootDepth int
 	stack     []*openBranch // root-to-deepest spine of branches still gaining children
 	leafCount int
 }
@@ -96,6 +101,21 @@ func NewBuilder(sink NodeSink) *Builder {
 		sink = func([]byte, []byte) error { return nil }
 	}
 	return &Builder{sink: sink, keyLen: -1}
+}
+
+// NewSubtrieBuilder returns a Builder for the subtrie hanging below rootDepth
+// nibbles of already-consumed path. Every key given to AddLeaf must share the
+// same first rootDepth nibbles; finish with SubtrieRef (not Root) to get the
+// node reference the parent stores for this subtrie.
+//
+// Emitted paths are absolute — the keys carry their full leading nibbles — so
+// a subtrie's rows are byte-identical to the rows the same keys produce in a
+// single whole-trie build. That is what lets N subtries be built concurrently
+// and their rows written through independent sinks.
+func NewSubtrieBuilder(sink NodeSink, rootDepth int) *Builder {
+	b := NewBuilder(sink)
+	b.rootDepth = rootDepth
+	return b
 }
 
 // AddLeaf inserts a (keyNibbles, value) pair into the trie. keyNibbles must be
@@ -232,36 +252,61 @@ func (b *Builder) Root() (common.Hash, error) {
 		}
 		return common.HexToHash(EmptyTrieHashHex), nil
 	}
+	rootRLP, err := b.fold()
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return rlpToRootHash(rootRLP), nil
+}
+
+// SubtrieRef finalizes a subtrie built by NewSubtrieBuilder and returns the
+// node reference its parent (the node at depth rootDepth-1) should store: the
+// node RLP inline when under 32 bytes, otherwise its hash reference — exactly
+// what a whole-trie build would have placed in that child slot.
+//
+// An empty subtrie returns (nil, nil) and emits no rows: a parent branch stores
+// nothing for a first nibble no key uses. That differs from Root, which emits
+// the standalone empty-trie sentinel.
+func (b *Builder) SubtrieRef() ([]byte, error) {
+	if b.leafCount == 0 {
+		return nil, nil
+	}
+	return b.fold()
+}
+
+// fold commits the final open leaf and folds the whole spine, returning the RLP
+// reference of this (sub)trie's topmost node. The terminal parent depth is
+// rootDepth-1, so a standalone trie (rootDepth 0) folds against -1 exactly as
+// before and a subtrie folds against the ancestor that consumed its prefix —
+// which is what decides whether the top node needs an enclosing extension.
+func (b *Builder) fold() ([]byte, error) {
+	terminalParentDepth := b.rootDepth - 1
 
 	if len(b.stack) == 0 {
-		// Single-leaf trie: the root is the leaf itself.
-		leafRLP, err := b.emitLeafRows([]byte{}, b.prevKey, b.prevVal)
-		if err != nil {
-			return common.Hash{}, err
-		}
-		return rlpToRootHash(leafRLP), nil
+		// Single-leaf (sub)trie: the top node is the leaf itself, sitting at
+		// the path the ancestors already consumed.
+		return b.emitLeafRows(b.prevKey[:b.rootDepth], b.prevKey[b.rootDepth:], b.prevVal)
 	}
 
 	// Commit the final open leaf to the top branch.
 	top := b.stack[len(b.stack)-1]
 	prevLeafRLP, err := b.emitLeafRows(b.prevKey[:top.depth+1], b.prevKey[top.depth+1:], b.prevVal)
 	if err != nil {
-		return common.Hash{}, err
+		return nil, err
 	}
 	top.children[b.prevKey[top.depth]] = prevLeafRLP
 
-	// Fold the whole spine up to the root.
 	var rootRLP []byte
 	for len(b.stack) > 0 {
 		p := b.stack[len(b.stack)-1]
 		b.stack = b.stack[:len(b.stack)-1]
-		parentDepth := -1
+		parentDepth := terminalParentDepth
 		if len(b.stack) > 0 {
 			parentDepth = b.stack[len(b.stack)-1].depth
 		}
 		pref, err := b.finalizeBranch(p, parentDepth)
 		if err != nil {
-			return common.Hash{}, err
+			return nil, err
 		}
 		if len(b.stack) > 0 {
 			parent := b.stack[len(b.stack)-1]
@@ -270,7 +315,35 @@ func (b *Builder) Root() (common.Hash, error) {
 			rootRLP = pref
 		}
 	}
-	return rlpToRootHash(rootRLP), nil
+	return rootRLP, nil
+}
+
+// CombineSubtrieRefs emits the depth-0 root branch over per-first-nibble
+// subtrie references and returns the trie root hash.
+//
+// Requires at least two non-empty refs. With fewer, the real root is not a
+// depth-0 branch — one populated nibble means the root is that subtrie's own
+// top node, reached through an extension carrying the shared leading nibble —
+// so callers must build those cases with a single whole-trie Builder. Erroring
+// is deliberate: silently encoding a branch there would yield a wrong root.
+func CombineSubtrieRefs(sink NodeSink, refs [16][]byte) (common.Hash, error) {
+	populated := 0
+	for _, r := range refs {
+		if len(r) > 0 {
+			populated++
+		}
+	}
+	if populated < 2 {
+		return common.Hash{}, fmt.Errorf(
+			"CombineSubtrieRefs: need >=2 populated first nibbles, got %d; build this trie with NewBuilder instead", populated)
+	}
+	branchRLP := EncodeBranch(refs, nil)
+	if sink != nil {
+		if err := sink([]byte{}, branchRLP); err != nil {
+			return common.Hash{}, err
+		}
+	}
+	return rlpToRootHash(branchRLP), nil
 }
 
 // finalizeBranch encodes and emits a branch node (and, when it sits below its
