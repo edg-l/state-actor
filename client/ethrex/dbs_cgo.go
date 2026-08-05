@@ -378,6 +378,23 @@ func openEthrexDB(dbPath string) (*ethrexDB, error) {
 	// no separate SetMaxBackgroundJobs needed.
 	dbOpts.IncreaseParallelism(parallelism)
 
+	// Split each compaction's key range across `parallelism` threads. RocksDB
+	// defaults max_subcompactions to 1, which makes Close()'s CompactRangeCF a
+	// single-threaded merge of every L0 file in the CF while the whole
+	// background pool idles.
+	//
+	// Measured at a 3 GB target, 3 runs per arm, identical roots: Close 22 s ->
+	// 8 s (2.75x) for a 62.3 s -> 54.0 s whole-run median (-13%). Phase 2 pays
+	// 31 s -> 38 s, because in-import L0 compactions subcompact too and compete
+	// with the import; Close wins by more than phase 2 loses.
+	//
+	// Subcompactions partition by key range, so each thread reads a slice of
+	// the input files rather than a copy of all of them: the memory term is
+	// per-thread readahead plus one output builder, tens of MiB. That is why
+	// this is safe where concurrency ACROSS CFs was not — see the CF loop in
+	// Close, which stays serial for exactly that reason.
+	dbOpts.SetMaxSubcompactions(uint32(parallelism))
+
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(
 		dbOpts, dbPath, cfNames, cfOpts,
 	)
